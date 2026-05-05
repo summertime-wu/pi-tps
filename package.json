@@ -1,0 +1,19 @@
+{
+  "name": "pi-tps",
+  "version": "1.0.0",
+  "description": "TPS stats widget with waterfall trace visualization for pi coding agent",
+  "keywords": ["pi-package", "pi-extension", "tps", "tokens-per-second", "waterfall"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/summertime-wu/pi-tps"
+  },
+  "pi": {
+    "extensions": ["extensions"],
+    "image": "https://pic1.imgdb.cn/item/69f9fb66a5f82cd27f48c614.png"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-tui": "*",
+    "@mariozechner/pi-coding-agent": "*"
+  }
+}
