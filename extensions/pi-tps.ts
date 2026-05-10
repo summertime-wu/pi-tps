@@ -41,6 +41,7 @@ interface TraceNode {
   endTime: number;
   ttftTime: number;
   thinkEndTime: number;
+  requestSentTime?: number;  // API request sent time (before_provider_request)
   hasThinking?: boolean;
   inputTokens?: number;
   outputTokens?: number;
@@ -256,6 +257,8 @@ export default function (pi: ExtensionAPI) {
 
   let sessionStartTime = 0;
   let msgStartTime = 0;
+  let turnStartTime = 0;       // turn_start timestamp
+  let requestSentTime = 0;     // before_provider_request timestamp
   // firstContentTime: first content arrival (text OR thinking) — marks TTFT
   let firstContentTime = 0;
   // textStartTime: first text delta — marks end of thinking phase, start of text gen
@@ -367,12 +370,14 @@ export default function (pi: ExtensionAPI) {
         result = p.toolBar(repeat(BAR_TOOL, totalChars));
       }
     } else if (t.type === "tool") {
-      const count = t.foldCount || 1;
-      result = p.toolBar(repeat(BAR_TOOL, count));
+      // Tool spans should reflect duration on the waterfall timeline.
+      // foldCount is already shown in the name (×N); using it here makes long tools look like 1-cell blips.
+      result = p.toolBar(repeat(BAR_TOOL, Math.max(totalChars, 1)));
     } else if (t.type === "llm") {
       if (durMs <= 0) { result = p.ttft(repeat(BAR_TTFT, totalChars)); }
       else {
-        const ttftMs = t.ttftTime > 0 ? clamp(t.ttftTime - t.startTime, 0, durMs) : durMs;
+        const ttftStart = t.requestSentTime ?? t.startTime;
+        const ttftMs = t.ttftTime > 0 ? clamp(t.ttftTime - ttftStart, 0, durMs) : durMs;
         let thinkMs = 0;
         if (t.hasThinking) {
           const tEnd = t.thinkEndTime > 0 ? t.thinkEndTime : (t.endTime === 0 ? now : t.endTime);
@@ -439,7 +444,8 @@ export default function (pi: ExtensionAPI) {
         totalInput += t.inputTokens || 0;
         totalOutput += t.outputTokens || 0;
         const durMs = Math.max(end - t.startTime, 0);
-        const ttftMs = t.ttftTime > 0 ? clamp(t.ttftTime - t.startTime, 0, durMs) : durMs;
+        const ttftStart = t.requestSentTime ?? t.startTime;
+        const ttftMs = t.ttftTime > 0 ? clamp(t.ttftTime - ttftStart, 0, durMs) : durMs;
         if (ttftMs > 0) segments.push({ type: "ttft", ms: ttftMs });
         let thinkMs = 0;
         if (t.hasThinking) {
@@ -693,8 +699,13 @@ export default function (pi: ExtensionAPI) {
 
     const rawThink = Math.floor(streamedThinkLen / 4);
     const showTtft = getConfig().showTtft;
-    const ttftStr = showTtft && firstContentTime > 0 ? fmtDuration(firstContentTime - msgStartTime) : null;
-    const totalDurationStr = (totalInputTokens > 0 || totalOutputTokens > 0) ? fmtDuration(now - sessionStartTime) : null;
+    // TTFT: use requestSentTime if available, fallback to msgStartTime
+    const ttftBase = requestSentTime > 0 ? requestSentTime : msgStartTime;
+    const ttftStr = showTtft && firstContentTime > 0 ? fmtDuration(firstContentTime - ttftBase) : null;
+    const totalDurationStr = turnStartTime > 0 ? fmtDuration(now - turnStartTime) : null;
+
+    // LLM call duration: use requestSentTime if available
+    const llmDuration = requestSentTime > 0 ? now - requestSentTime : now - msgStartTime;
 
     lastStatsLine = {
       tps,
@@ -703,7 +714,7 @@ export default function (pi: ExtensionAPI) {
       toolCount: toolCallCount,
       thinkTokens: rawThink > 0 ? formatNum(rawThink) : null,
       ttft: ttftStr,
-      msgDuration: fmtDuration(now - msgStartTime),
+      msgDuration: fmtDuration(llmDuration),
       totalDuration: totalDurationStr,
     };
   }
@@ -807,6 +818,8 @@ export default function (pi: ExtensionAPI) {
 
       sessionStartTime = Date.now();
       msgStartTime = 0;
+      turnStartTime = 0;
+      requestSentTime = 0;
       firstContentTime = 0;
       textStartTime = 0;
       streamedTextLen = 0;
@@ -829,8 +842,43 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
+  // ── turn / provider timing ──
+
+  pi.on("turn_start", async () => {
+    try {
+      turnStartTime = Date.now();
+    } catch (e) {
+      console.error("pi-tps: turn_start error", e);
+    }
+  });
+
+  pi.on("turn_end", async () => {
+    try {
+      if (turnStartTime > 0 && lastStatsLine) {
+        lastStatsLine.totalDuration = fmtDuration(Date.now() - turnStartTime);
+      }
+      turnStartTime = 0;
+      refreshWidget();
+    } catch (e) {
+      console.error("pi-tps: turn_end error", e);
+    }
+  });
+
+  pi.on("before_provider_request", async () => {
+    try {
+      // only track during agent turns (skip compaction, etc.)
+      if (turnStartTime > 0) {
+        requestSentTime = Date.now();
+      }
+    } catch (e) {
+      console.error("pi-tps: before_provider_request error", e);
+    }
+  });
+
   pi.on("agent_end", async (_event, ctx) => {
     try {
+      turnStartTime = 0;
+      requestSentTime = 0;
       if (lastStatsLine) {
         const p = getConfig().colorPreset === "theme"
           ? makeThemePalette(ctx.ui.theme)
@@ -869,6 +917,7 @@ export default function (pi: ExtensionAPI) {
         endTime: 0,
         ttftTime: 0,
         thinkEndTime: 0,
+        requestSentTime: requestSentTime > 0 ? requestSentTime : undefined,
       };
       traces.push(activeLlmTrace);
       trimTraces();
@@ -916,7 +965,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       const hasDelta = deltaEvent?.type === "text_delta" || deltaEvent?.type === "thinking_delta";
-      if (hasDelta && now - lastRefreshTime > 160) {
+      if (hasDelta && now - lastRefreshTime > 80) {
         lastRefreshTime = now;
         updateStats(event.message, now);
         refreshWidget();
@@ -931,8 +980,10 @@ export default function (pi: ExtensionAPI) {
       if (event.message.role !== "assistant") return;
       if (msgStartTime <= 0) return;
 
+      const now = Date.now();
+
       if (activeLlmTrace) {
-        activeLlmTrace.endTime = Date.now();
+        activeLlmTrace.endTime = now;
         const usage = event.message.usage;
         if (usage) {
           activeLlmTrace.inputTokens = usage.input ?? 0;
@@ -942,8 +993,12 @@ export default function (pi: ExtensionAPI) {
       activeLlmTrace = null;
       invalidateFoldCache();
 
-      const now = Date.now();
       updateStats(event.message, now);
+
+      // override msgDuration with requestSentTime-based LLM call duration
+      if (lastStatsLine && requestSentTime > 0) {
+        lastStatsLine.msgDuration = fmtDuration(now - requestSentTime);
+      }
 
       const outputTokens = event.message.usage?.output ?? 0;
       const inputTokens = event.message.usage?.input ?? 0;
@@ -951,6 +1006,7 @@ export default function (pi: ExtensionAPI) {
       totalInputTokens += Math.max(inputTokens, msgStartInputTokens);
       totalOutputTokens += outputTokens;
 
+      requestSentTime = 0;
       refreshWidget();
     } catch (e) {
       console.error("pi-tps: message_end error", e);
